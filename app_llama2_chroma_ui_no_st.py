@@ -106,7 +106,7 @@ def split_documents(documents: list[Document]) -> tuple[list[Document], list[Doc
 
     return text_docs, python_docs
 
-def ingest_docs():
+def ingest_docs(embeddings: HuggingFaceInstructEmbeddings):
     logging.info(f"Loading documents from {SOURCE_DIRECTORY}")
     documents = load_documents(SOURCE_DIRECTORY)
     text_documents, python_documents = split_documents(documents)
@@ -122,13 +122,13 @@ def ingest_docs():
     # Create embeddings
     # embeddings = load_embedding_model()
 
-    # db = Chroma.from_documents(
-    #     texts,
-    #     embeddings,
-    #     persist_directory=PERSIST_DIRECTORY,
-    #     client_settings=CHROMA_SETTINGS,
+    db = Chroma.from_documents(
+        texts,
+        embeddings,
+        persist_directory=PERSIST_DIRECTORY,
+        client_settings=CHROMA_SETTINGS,
 
-    # )
+    )
 
 def handle_user_input(user_question):
     print("handle user input")
@@ -259,9 +259,10 @@ def load_chat_model(device_type, model_id, model_basename=None):
 
 
 def main():
-
     # load the embedding model
     embeddings = load_embedding_model()
+
+    ingest_docs(embeddings)
 
     # load the vectorstore
     db = Chroma(
@@ -322,11 +323,8 @@ def main():
     #                     with open(file_path, 'wb') as f:
     #                         f.write(doc.getvalue())
 
-    ingest_docs()
 
-    vectorstore = get_vectorstore(text_chunks)
 
-    print ("vectors written")
 
     #conversation history with reinitialization
     #conversation = get_conversation_chain(vectorstore)
