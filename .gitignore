@@ -1,1 +1,4 @@
 ./data
+./DB
+./models
+*example.py

@@ -1,20 +1,27 @@
+from flask import Flask, request
+import json
 #python -m pip install -r requirements.txt
 
 import logging
 import time
-import click
+import os
 import torch
 from auto_gptq import AutoGPTQForCausalLM
+import streamlit as st
+from htmlTemplates import css, bot_template, user_template
+
 from huggingface_hub import hf_hub_download
 from langchain.chains import RetrievalQA
 from langchain.embeddings import HuggingFaceInstructEmbeddings
 from langchain.llms import HuggingFacePipeline, LlamaCpp
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
+from langchain.text_splitter import Language, RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain.chains import ConversationalRetrievalChain
 
 # from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from langchain.vectorstores import Chroma
-from langchain.vectorstores import Milvus
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -24,10 +31,39 @@ from transformers import (
     pipeline,
 )
 
-from constants import EMBEDDING_MODEL_NAME, PERSIST_DIRECTORY, MODEL_ID, MODEL_BASENAME
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+from constants import (
+    CHROMA_SETTINGS,
+    DOCUMENT_MAP,
+    EMBEDDING_MODEL_NAME,
+    PERSIST_DIRECTORY,
+    SOURCE_DIRECTORY,
+    MODEL_ID,
+    MODEL_BASENAME,
+)
 
 
-def load_model(device_type, model_id, model_basename=None):
+
+# LOAD MODELS FROM LOCAL
+def load_embedding_model():
+
+    # Check if embeddings are already in the session state
+    # if "embeddings" in st.session_state:
+    #     return st.session_state.embeddings
+
+    model_name = "hkunlp/instructor-xl"
+    local_model_dir = "./models/sentence_transformers/" + model_name
+    model_kwargs = {'device': 'cuda'}
+    encode_kwargs = {'normalize_embeddings': True}
+    embeddings = HuggingFaceInstructEmbeddings(model_name=model_name, cache_folder=local_model_dir, model_kwargs=model_kwargs, encode_kwargs=encode_kwargs)
+
+    # Store embeddings in the session state for reuse
+    # st.session_state.embeddings = embeddings
+
+    return embeddings
+
+def load_chat_model(device_type, model_id, model_basename=None):
     """
     Select a model for text generation using the HuggingFace library.
     If you are running this for the first time, it will download a model for you.
@@ -60,7 +96,7 @@ def load_model(device_type, model_id, model_basename=None):
             if device_type.lower() == "mps":
                 kwargs["n_gpu_layers"] = 1000
             if device_type.lower() == "cuda":
-                kwargs["n_gpu_layers"] = 500
+                kwargs["n_gpu_layers"] = 20
                 kwargs["n_batch"] = max_ctx_size
             return LlamaCpp(**kwargs)
 
@@ -119,8 +155,8 @@ def load_model(device_type, model_id, model_basename=None):
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_length=2048,
-        temperature=0.6,
+        max_length=4096,
+        temperature=0,
         top_p=0.95,
         repetition_penalty=1.15,
         generation_config=generation_config,
@@ -132,7 +168,7 @@ def load_model(device_type, model_id, model_basename=None):
     return local_llm
 
 
-
+#embeddings = load_embedding_model()
 
 model_name = "hkunlp/instructor-xl"
 local_model_dir = "./models/sentence_transformers/" + model_name
@@ -140,68 +176,60 @@ model_kwargs = {'device': 'cuda'}
 encode_kwargs = {'normalize_embeddings': True}
 embeddings = HuggingFaceInstructEmbeddings(model_name=model_name, cache_folder=local_model_dir, model_kwargs=model_kwargs, encode_kwargs=encode_kwargs)
 
-# uncomment the following line if you used HuggingFaceEmbeddings in the ingest.py
-# embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-
 # load the vectorstore
-# db = Chroma(
-#     persist_directory=PERSIST_DIRECTORY,
-#     embedding_function=embeddings,
-
-# )
-
-
-db: Milvus = Milvus(
+db = Chroma(
+    persist_directory=PERSIST_DIRECTORY,
     embedding_function=embeddings,
-    collection_name="LangChainCollection",
-    index_params={
-        "metric_type": "L2",
-        "index_type": "HNSW",
-    },
-    search_params={"metric_type": "L2"},
-    connection_args={"host": "127.0.0.1", "port": "19530"},
+
 )
 
-retriever = db.as_retriever()
+# initiate retriever
+# retriever = db.as_retriever()
 
-docs = db.similarity_search("What is RAAC?")
+# template = """Use the following pieces of context to answer the question at the end. If you don't know the answer,\
+# just say that you don't know, don't try to make up an answer.
 
+# {context}
 
-template = """Use the following pieces of context to answer the question at the end. If you don't know the answer,\
-just say that you don't know, don't try to make up an answer.
+# {history}
+# Question: {question}
+# Helpful Answer:"""
 
-{context}
+# prompt = PromptTemplate(input_variables=["history", "context", "question"], template=template)
+# memory = ConversationBufferMemory(input_key="question", memory_key="history")
 
-{history}
-Question: {question}
-Helpful Answer:"""
+#llm = load_chat_model("cuda", model_id=MODEL_ID, model_basename=MODEL_BASENAME)
 
-prompt = PromptTemplate(input_variables=["history", "context", "question"], template=template)
-memory = ConversationBufferMemory(input_key="question", memory_key="history")
+retriever = db.as_retriever() 
 
-llm = load_model("cuda", model_id=MODEL_ID, model_basename=MODEL_BASENAME)
-
-qa = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
+memory = ConversationBufferMemory(
+    memory_key='chat_history', return_messages=True)
+conversation_chain = ConversationalRetrievalChain.from_llm(
+    llm=load_chat_model("cuda", model_id=MODEL_ID, model_basename=MODEL_BASENAME),
     retriever=retriever,
-    return_source_documents=True,
-    chain_type_kwargs={"prompt": prompt, "memory": memory},
+    memory=memory
 )
-# Interactive questions and answers
-while True:
-    query = input("\nEnter a query: ")
-    if query == "exit":
-        break
-    # Get the answer from the chain
-    start_time = time.time()
-    res = qa(query)
-    answer, docs = res["result"], res["source_documents"]
 
-    # Print the result
-    print("\n\n> Question:")
-    print(query)
-    print("\n> Answer:")
-    print(answer)
-    print("ANSWER PROCURED %s seconds ---" % (time.time() - start_time))
 
+app = Flask(__name__)
+
+@app.route("/llama2/prompt", methods=['POST'])
+def respond():
+    user_prompt = request.form.get("user_prompt")
+    res = conversation_chain({"question": user_prompt, "chat_history": memory})
+    ch = res["chat_history"]
+    reshaped_chat_history = []
+    for i in ch:
+        reshaped_chat_history.append(i.content)
+    
+    result = {"question": res["question"], "answer": res["answer"], "chat_history": reshaped_chat_history }
+    json_result = json.dumps(result)
+    return json_result
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+
+
+
+    #response = requests.post(main_prompt_url, data={"user_prompt": user_prompt})
